@@ -374,40 +374,123 @@ export function claimMarkerValid(root, expectedSession) {
 // PROVABLY read-only. Unknown verb, unknown dialect, unreadable input — all
 // mutations as far as the guard is concerned.
 
-// Separators are honoured outside quotes only, so `grep 'a|b' file` stays one
-// segment instead of splitting into a bogus `b' file` command.
-function shellSegments(command) {
-  const segments = [];
-  let current = "";
+// SOP-177: stands in for a `$(...)` inside a segment's text. The substitution
+// body is extracted and judged on its own (recursively); the marker keeps the
+// surrounding word shape (quoted or not, leading dash or not) visible.
+const SUBST_MARK = "\u0001";
+
+// Index of the `)` that closes a `$(` whose body starts at `from`, or -1.
+// Quote-aware (a `)` inside quotes does not count) and recursive for nested
+// `$(`, which restarts quoting.
+function matchParen(source, from) {
+  let depth = 1;
   let quote = "";
-  for (const character of command) {
-    if (quote) {
-      current += character;
-      if (character === quote) quote = "";
+  for (let index = from; index < source.length; index += 1) {
+    const character = source[index];
+    if (quote === "'") {
+      if (character === "'") quote = "";
       continue;
     }
-    if (character === '"' || character === "'") {
+    if (character === "\\") {
+      index += 1;
+      continue;
+    }
+    if (character === "$" && source[index + 1] === "(") {
+      const end = matchParen(source, index + 2);
+      if (end < 0) return -1;
+      index = end;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') {
       quote = character;
-      current += character;
+      continue;
+    }
+    if (character === "(") depth += 1;
+    else if (character === ")") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+// Splits a command into segments at ; | & and newlines, honouring (outside
+// single quotes) backslash escapes, (outside quotes) comments, and replacing
+// every `$(...)` by SUBST_MARK while remembering its body. Separators inside
+// quotes or inside `$(...)` do not split, so `grep 'a|b' file` stays one
+// segment. Returns null for anything it cannot parse with certainty
+// (unbalanced quote or `$(`, trailing backslash, backtick) — the caller treats
+// that as a mutation.
+function scanShell(command) {
+  const segments = [];
+  let text = "";
+  let substitutions = [];
+  let quote = "";
+  const flush = () => {
+    const trimmed = text.trim();
+    if (trimmed) segments.push({ text: trimmed, substitutions });
+    text = "";
+    substitutions = [];
+  };
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (quote === "'") {
+      text += character;
+      if (character === "'") quote = "";
+      continue;
+    }
+    if (character === "\\") {
+      if (index + 1 >= command.length) return null;
+      text += character + command[index + 1];
+      index += 1;
+      continue;
+    }
+    if (character === "`") return null;
+    if (character === "$" && command[index + 1] === "(") {
+      const end = matchParen(command, index + 2);
+      if (end < 0) return null;
+      substitutions.push({ inner: command.slice(index + 2, end), quoted: quote === '"' });
+      text += SUBST_MARK;
+      index = end;
+      continue;
+    }
+    if (quote === '"') {
+      text += character;
+      if (character === '"') quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      text += character;
+      continue;
+    }
+    if (character === "#" && (text === "" || /\s$/.test(text))) {
+      while (index + 1 < command.length && command[index + 1] !== "\n") index += 1;
       continue;
     }
     if (character === ";" || character === "|" || character === "&" || character === "\n" || character === "\r") {
-      segments.push(current);
-      current = "";
+      flush();
       continue;
     }
-    current += character;
+    text += character;
   }
-  segments.push(current);
-  return segments.map((segment) => segment.trim()).filter(Boolean);
+  if (quote) return null;
+  flush();
+  return segments;
 }
 
 // Anything that can smuggle a second command past the verb allowlist. Checked
 // against the raw command, quotes included: a read-only `grep '>'` blocked by
 // this is a false alarm the operator can fix with a claim, while the reverse
-// mistake is the bug this card exists to close.
+// mistake is the bug this card exists to close. `$(...)` is NOT here any more
+// (SOP-177): scanShell extracts it and commandReadOnly judges its body.
 const EVALUATION_TRAPS = [
-  /\$\(/, // POSIX command substitution
+  /[\u0001]/, // SUBST_MARK is reserved for scanShell
+  /\$'/, // ANSI-C quoting: its quote rules differ from the scanner's
   /`/, // POSIX backtick substitution
   /<\(/, // process substitution
   /\$\{[^}]*[;|&]/, // parameter expansion hiding a command
@@ -459,10 +542,14 @@ const HEAD_ARGUMENT_TRAPS = {
   // (`1w file`, `$w file`, `s/a/b/w file`) — the address itself is often a
   // digit, so the trap excludes only a preceding letter/underscore (which
   // would make it part of a word like "new" or "raw"), not a digit.
-  sed: /(^|\s)-\S*i|(^|[^A-Za-z_])w\s+\S/,
-  sort: /(^|\s)-o(\s|$)/,
+  sed: /(^|\s)-\S*i|(^|[^A-Za-z_])[wWe]\s+\S|\/[0-9gIpmM]*[we][0-9gIpmM]*['"]?(\s|$)/,
+  sort: /(^|\s)-\S*o|--output/,
+  // SOP-177: the heads below mutate or execute through one flag each.
+  yq: /(^|\s)-\S*i|--inplace/,
+  date: /(^|\s)(-s|--set)\b/,
+  tree: /(^|\s)-o\b/,
   grep: /(^|\s)-\S*[of]\s|--output/,
-  rg: /(^|\s)--files-with-matches\s*>|(^|\s)-r\b|--replace/,
+  rg: /(^|\s)--files-with-matches\s*>|(^|\s)-r\b|--replace|--pre\b/,
   gh: /(^|\s)(create|edit|delete|close|merge|comment|clone|sync|rerun|cancel)\b|-X\s*(POST|PUT|PATCH|DELETE)/i,
   // `docker logs -f`/`--follow` never returns, so it is treated the same as a
   // mutation: a command this hook cannot observe finishing is not proven safe.
@@ -484,7 +571,7 @@ const GIT_SIMPLE_READ_SUBCOMMANDS = new Set([
 
 // `git branch` with no argument, or only a listing flag, reads; `-d/-D` (delete),
 // `-m/-M` (rename) and `-c/-C` (copy) mutate (AC 19) and are deliberately absent.
-const GIT_BRANCH_READ_ARGS = new Set(["--list", "-a", "-r", "-v", "--show-current"]);
+const GIT_BRANCH_READ_ARGS = new Set(["--list", "-l", "-a", "-r", "-v", "-vv", "--show-current"]);
 
 // S2 door 4 / AC 18a: the same two prefixes Write/Edit already publish
 // without a claim (PLANNING_WRITE_PATH in claim-guard.mjs) — duplicated here
@@ -588,15 +675,33 @@ function tokenize(segment) {
 function gitReadOnly(segment) {
   const tokens = tokenize(segment);
   let index = 1;
-  if (tokens[index] === "-C") index += 2;
+  // Global options that change where git looks or how it pages, never what it
+  // writes (SOP-177).
+  while (index < tokens.length) {
+    if (tokens[index] === "-C") index += 2;
+    else if (tokens[index] === "--no-pager" || tokens[index] === "-P" || tokens[index] === "--no-optional-locks") index += 1;
+    else break;
+  }
   const subcommand = tokens[index] ?? "";
   const rest = tokens.slice(index + 1);
 
-  if (subcommand === "diff") {
-    return !rest.some((token) => token === "--output" || token.startsWith("--output="));
+  // Flags that make an otherwise read-only subcommand write a file or run a
+  // program: `git log --output=f`, `git grep -O<cmd>`, external diff/textconv.
+  if (rest.some((token) => /^(--output(=|$)|--ext-diff$|--textconv$|-O|--open-files-in-pager)/.test(token))) {
+    return false;
   }
+  if (subcommand === "diff") return true;
   if (subcommand === "branch") {
-    return rest.length === 0 || rest.every((token) => GIT_BRANCH_READ_ARGS.has(token));
+    // `--list` turns positional arguments into patterns; without it
+    // `git branch name` creates a branch.
+    const listing = rest.some((token) => token === "--list" || token === "-l");
+    return (
+      rest.length === 0 ||
+      rest.every((token) => GIT_BRANCH_READ_ARGS.has(token) || (listing && token !== "" && !token.startsWith("-")))
+    );
+  }
+  if (subcommand === "remote") {
+    return rest.length === 0 || rest[0] === "-v" || rest[0] === "show" || rest[0] === "get-url";
   }
   if (subcommand === "worktree") {
     return rest.length === 1 && rest[0] === "list";
@@ -619,7 +724,7 @@ function pythonReadOnly(segment) {
 function segmentHead(segment) {
   const head = segment.split(/\s+/)[0] ?? "";
   // `FOO=bar cmd`, `(cmd`, `$cmd`, `./script` — none of them prove anything.
-  if (!head || /[=$(){}]/.test(head)) return "";
+  if (!head || /[=$(){}\u0001]/.test(head)) return "";
   return head.replace(/^\.\//, "");
 }
 
@@ -663,12 +768,124 @@ const REDIRECTION = /(^|[^<>0-9])>{1,2}\s*[^&\s]/;
 // read-only is treated as a mutation by the callers of this function.
 export function commandReadOnly(command) {
   if (typeof command !== "string" || !command.trim()) return false;
+  return scriptReadOnly(command, 0);
+}
+
+// SOP-177. Heads whose behaviour no argument can turn into a write or an
+// execution: only for these may an UNQUOTED `$(...)` (or an unquoted tainted
+// loop variable) supply arguments, because it can expand into several words
+// and smuggle a flag. Everywhere else a substitution must be one double-quoted
+// word that does not start with a dash.
+const NO_FLAG_RISK_HEADS = new Set([
+  "echo", "printf", "ls", "ll", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep",
+  "stat", "file", "basename", "dirname", "realpath", "readlink", "du", "cut", "tr",
+  "uniq", "nl", "column", "fold", "test", "true", "false", "pwd", "which", "type",
+]);
+const MAX_SCRIPT_DEPTH = 4;
+const FOR_HEADER = /^for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in(\s+[\s\S]*)?$/;
+
+// A script is read-only when every segment is, every `$(...)` body is, and
+// every `for` loop is balanced, iterates a literal/glob list (or a read-only
+// substitution) and has only read-only commands in its body.
+function scriptReadOnly(command, depth) {
+  if (depth > MAX_SCRIPT_DEPTH) return false;
   if (EVALUATION_TRAPS.some((trap) => trap.test(command))) return false;
   const stripped = withoutDiscards(command);
   if (REDIRECTION.test(stripped)) return false;
-  const segments = shellSegments(stripped);
-  if (!segments.length) return false;
-  return segments.every(segmentReadOnly);
+  const segments = scanShell(stripped);
+  if (!segments) return false;
+  if (!segments.length) return depth > 0;
+
+  const loops = []; // one { variable, tainted } per open `for`
+  let expectDo = false;
+  for (const segment of segments) {
+    let text = segment.text;
+
+    if (expectDo) {
+      if (text !== "do" && !text.startsWith("do ")) return false;
+      expectDo = false;
+      text = text.slice(2).trim();
+      if (!text) continue;
+    }
+    if (text === "done") {
+      if (!loops.length) return false;
+      loops.pop();
+      continue;
+    }
+
+    // Every substitution body must itself be read-only.
+    if (!segment.substitutions.every((substitution) => scriptReadOnly(substitution.inner, depth + 1))) return false;
+    const unquotedSubstitution = segment.substitutions.some((substitution) => !substitution.quoted);
+
+    const header = FOR_HEADER.exec(text);
+    if (header) {
+      const words = tokenize(header[2] ?? "");
+      if (!words.length) return false;
+      // A list word is a literal or glob. A leading dash could inject a flag
+      // into a body command; any other `$`, parenthesis or brace group is
+      // dynamic and unproven.
+      for (const word of words) {
+        if (word.startsWith("-") || /[()]/.test(word.replaceAll(SUBST_MARK, ""))) return false;
+        if (/\$/.test(word)) return false;
+      }
+      loops.push({ variable: header[1], tainted: unquotedSubstitution || words.some((word) => word.includes(SUBST_MARK)) });
+      expectDo = true;
+      continue;
+    }
+
+    const head = segmentHead(text);
+    if (!head) return false;
+    const taintedVariable = loops.some(
+      (loop) => loop.tainted && new RegExp(`\\$(\\{${loop.variable}\\}|${loop.variable}\\b)`).test(text),
+    );
+    if ((unquotedSubstitution || taintedVariable) && !NO_FLAG_RISK_HEADS.has(head)) return false;
+    if (tokenize(text).some((token) => token.includes(SUBST_MARK) && token.startsWith("-"))) return false;
+
+    if (!segmentReadOnly(text)) return false;
+  }
+  return loops.length === 0 && !expectDo;
+}
+
+// The same command with the contents of quoted strings blanked out, except for
+// `$(...)` bodies, which still run: WRITE_COMMANDS asks whether a write VERB
+// is being executed, not whether the word appears in a grep pattern.
+function withoutQuotedText(command) {
+  let result = "";
+  let quote = "";
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index];
+    if (quote === "'") {
+      if (character === "'") quote = "";
+      continue;
+    }
+    if (character === "\\") {
+      result += quote ? "" : character + (command[index + 1] ?? "");
+      index += 1;
+      continue;
+    }
+    if (character === "$" && command[index + 1] === "(") {
+      const end = matchParen(command, index + 2);
+      if (end < 0) return command;
+      result += ` ${command.slice(index + 2, end)} `;
+      index = end;
+      continue;
+    }
+    if (quote === '"') {
+      if (character === '"') quote = "";
+      continue;
+    }
+    if (character === "'" || character === '"') {
+      quote = character;
+      result += " ";
+      continue;
+    }
+    if (character === "#" && (result === "" || /\s$/.test(result))) {
+      while (index + 1 < command.length && command[index + 1] !== "\n") index += 1;
+      continue;
+    }
+    result += character;
+  }
+  return quote ? command : result;
 }
 
 // Kept as a second, independent opinion. commandReadOnly already blocks
@@ -708,7 +925,7 @@ export function commandWrites(command) {
   if (tlcValidatorInvocation(command)) return false;
   const stripped = withoutDiscards(command);
   if (REDIRECTION.test(stripped)) return true;
-  return WRITE_COMMANDS.test(command);
+  return WRITE_COMMANDS.test(withoutQuotedText(command));
 }
 
 // A hook that throws is a hook that fails closed on the wrong side: Claude Code
