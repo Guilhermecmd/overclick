@@ -12,6 +12,12 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+// `execFileSync` with an argv array is not "shelling out" in the sense the
+// header comment above warns about (no bash/sh interpreter, no shell string
+// parsing, no injection surface) — it is the one external dependency this
+// hook already assumes and inspects: a repository with no git binary has no
+// commands for this guard to gate in the first place (S2 door 4 / AC 18a).
+import { execFileSync } from "node:child_process";
 
 export function configFile() {
   if (process.env.OVERCLICK_CONFIG_FILE) return process.env.OVERCLICK_CONFIG_FILE;
@@ -204,12 +210,38 @@ export function isOverclickInstallDir(cwd) {
 // Every key a harness has been seen carrying a shell command under. A shell
 // tool whose command hides under some other key reads as empty here, and an
 // empty command is not proven read-only — so it blocks (OCL-134).
+// C36 / SNP-279: Codex's exec tool sends a shell command as an argv array
+// shaped exactly like [interpreter, flags, script] — e.g.
+// ["/bin/zsh", "-lc", "sed -n '1,5p' SKILL.md"]. The generic `join(" ")`
+// below turns that into one opaque segment headed by the interpreter path,
+// so even a bare `sed -n` reading a skill file was classified as an unproven
+// mutation and blocked (live repro: a Codex smoke session with no card
+// claimed got "claima um card no board antes" on `sed -n ... && sed -n ...`,
+// C36's second failure mode). Recognizing this one well-known shape and
+// classifying the SCRIPT instead — recursively, through the same
+// segment-by-segment checks — fixes the false block without loosening
+// anything: a real write hidden in `bash -lc "rm -rf x"` is still classified
+// as a write, just now correctly (previously it was already blocked too,
+// only for the wrong, opaque reason).
+const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh", "ash"]);
+
+function shellCScript(parts) {
+  if (parts.length !== 3) return null;
+  const interpreter = (parts[0].split(/[\\/]/).pop() ?? "").toLowerCase();
+  if (!SHELL_INTERPRETERS.has(interpreter)) return null;
+  if (!/^-[a-z]*c[a-z]*$/i.test(parts[1])) return null;
+  return parts[2];
+}
+
 export function hookCommand(hookInput) {
   const input = hookInput?.tool_input ?? {};
   for (const key of ["command", "cmd", "commandLine", "command_line", "script", "shell_command", "powershell"]) {
     const value = input[key];
     if (typeof value === "string" && value.trim()) return value;
-    if (Array.isArray(value) && value.every((part) => typeof part === "string")) return value.join(" ");
+    if (Array.isArray(value) && value.every((part) => typeof part === "string")) {
+      const script = shellCScript(value);
+      return script !== null ? script : value.join(" ");
+    }
   }
   return "";
 }
@@ -453,6 +485,66 @@ const GIT_SIMPLE_READ_SUBCOMMANDS = new Set([
 // `git branch` with no argument, or only a listing flag, reads; `-d/-D` (delete),
 // `-m/-M` (rename) and `-c/-C` (copy) mutate (AC 19) and are deliberately absent.
 const GIT_BRANCH_READ_ARGS = new Set(["--list", "-a", "-r", "-v", "--show-current"]);
+
+// S2 door 4 / AC 18a: the same two prefixes Write/Edit already publish
+// without a claim (PLANNING_WRITE_PATH in claim-guard.mjs) — duplicated here
+// rather than imported both ways, since this module has no dependency on
+// that one and the two lists must read identically to stay in sync.
+const SPEC_PUBLISH_PATH = /(^|[\\/])\.specs[\\/]|(^|[\\/])docs[\\/]plano[\\/]aprovacoes[\\/]/;
+
+function runGit(cwd, args) {
+  try {
+    return execFileSync("git", args, { cwd, encoding: "utf8", timeout: 5000 }).trim();
+  } catch {
+    return null;
+  }
+}
+
+// Paths in the index right now — what a `git commit` with no pathspec is
+// about to commit.
+function gitStagedPaths(cwd) {
+  const out = runGit(cwd, ["diff", "--cached", "--name-only"]);
+  if (out === null || out === "") return [];
+  return out.split(/\r?\n/).filter(Boolean);
+}
+
+// Paths touched by every commit this branch has that its upstream does not —
+// what a `git push` or `gh pr create` is about to publish. No upstream (a
+// branch that has never been pushed) is not proven spec-only, so it returns
+// empty rather than guessing a base.
+function gitUnpushedPaths(cwd) {
+  const upstream = runGit(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+  if (upstream === null || upstream === "") return [];
+  const out = runGit(cwd, ["diff", "--name-only", `${upstream}..HEAD`]);
+  if (out === null || out === "") return [];
+  return out.split(/\r?\n/).filter(Boolean);
+}
+
+// AC 18a: the exact publish sequence a spec-lane session runs without a
+// claim — stage, commit, push, open the PR — passes only when every path it
+// touches is spec-only; a single product file anywhere in that set makes the
+// whole command an ordinary mutation like any other (claim required). Fails
+// closed: an empty change set, a `git`/network error, or a command this
+// function does not recognize as part of the sequence is never exempted.
+export function specOnlyPublish(command, cwd) {
+  if (!cwd) return false;
+  const trimmed = command.trim();
+
+  const addMatch = /^git\s+add\s+(.+)$/.exec(trimmed);
+  if (addMatch) {
+    const paths = tokenize(addMatch[1]).filter((token) => token && !token.startsWith("-"));
+    return paths.length > 0 && paths.every((p) => SPEC_PUBLISH_PATH.test(p));
+  }
+  if (/^git\s+commit\b/.test(trimmed)) {
+    const paths = gitStagedPaths(cwd);
+    return paths.length > 0 && paths.every((p) => SPEC_PUBLISH_PATH.test(p));
+  }
+  if (/^git\s+push\b/.test(trimmed) || /^gh\s+pr\s+create\b/.test(trimmed)) {
+    const paths = gitUnpushedPaths(cwd);
+    return paths.length > 0 && paths.every((p) => SPEC_PUBLISH_PATH.test(p));
+  }
+  return false;
+}
 
 // A quoted argument (`git -C "dir with spaces" log`) must stay one token, so
 // both `git -C <dir>` and the tlc validator path are read through a small

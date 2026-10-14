@@ -16,6 +16,7 @@ import {
   sessionClaimsProbe,
   parseJson,
   readStdin,
+  specOnlyPublish,
   writeClaimMarker,
   writeShapedInput,
   failOpen,
@@ -77,7 +78,7 @@ failOpen(async () => {
   // tool that was not literally called `Bash` — `PowerShell` on Windows — was
   // waved through and mutated the repo with no claim. The default is inverted
   // here: only what is PROVEN not to mutate returns early.
-  if (!mutationSuspected(hookInput, toolName)) return;
+  if (!mutationSuspected(hookInput, toolName, cwd)) return;
 
   const session = hookSession(hookInput);
   if (claimMarkerValid(cwd, session)) return;
@@ -107,7 +108,7 @@ function boardUnreachableRecoveryAllowed(hookInput, cwd) {
   return isOverclickInstallDir(cwd);
 }
 
-function mutationSuspected(hookInput, toolName) {
+function mutationSuspected(hookInput, toolName, cwd) {
   if (BOARD_TOOL.test(toolName)) return false;
   if (WRITE_TOOL.test(toolName)) return !planningWritePath(hookInput);
 
@@ -115,7 +116,13 @@ function mutationSuspected(hookInput, toolName) {
   // read-only passes, everything else — unknown verb, unknown dialect,
   // [System.IO.File]::WriteAllText — is a mutation.
   const command = hookCommand(hookInput);
-  if (command) return commandWrites(command) || !commandReadOnly(command);
+  if (command) {
+    // AC 18a: the publish sequence (stage, commit, push, open the PR) needs
+    // no claim when every path it touches is spec-only — checked against the
+    // real git state, never the command text alone (SNP-276).
+    if (specOnlyPublish(command, cwd)) return false;
+    return commandWrites(command) || !commandReadOnly(command);
+  }
 
   if (SHELL_TOOL.test(toolName)) return true;
   if (READ_TOOL.test(toolName)) return false;
