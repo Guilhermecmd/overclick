@@ -7,6 +7,7 @@ import {
   commandReadOnly,
   commandWrites,
   countTasks,
+  cwdBoundToBoard,
   enabled,
   hookCommand,
   hookCwd,
@@ -82,6 +83,11 @@ failOpen(async () => {
 
   const session = hookSession(hookInput);
   if (claimMarkerValid(cwd, session)) return;
+
+  // SOP-197: no card is owed for work outside any board project (a pane in
+  // ~, /tmp, a folder with no repository, a repository no project points at).
+  // Only a proven "not bound" passes; "could not tell" keeps the strict path.
+  if ((await cwdBoundToBoard(cwd)) === false) return;
 
   // A missing marker can be recovered only from this session's claim — but
   // only when the board actually answered. AC 20-21: when it did not, the

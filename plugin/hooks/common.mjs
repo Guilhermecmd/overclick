@@ -189,6 +189,81 @@ export async function sessionClaimsProbe(hookInput, limit) {
   }));
 }
 
+// SOP-197: the claim guard only has an opinion about work that lives in a
+// repository the board knows. A pane opened in a folder with no project (home,
+// /tmp, a scratch directory, a repository no board project points at) has no
+// card to claim, so it must not be told to claim one.
+//
+// Walks up from cwd. The innermost directory that holds `.overclick` (a repo
+// already used with the board) or `.git` (dir, or file for a worktree) wins.
+// `.overclick` in the home directory or the filesystem root is ignored: a
+// stray marker there must not turn every pane opened in ~ into a guarded one.
+export function findRepoRoot(cwd) {
+  if (!cwd) return null;
+  const home = path.resolve(os.homedir());
+  let dir = path.resolve(cwd);
+  for (;;) {
+    const parent = path.dirname(dir);
+    const ignoredMarker = dir === home || parent === dir;
+    if (!ignoredMarker && fs.existsSync(path.join(dir, ".overclick"))) {
+      return { root: dir, marked: true };
+    }
+    if (fs.existsSync(path.join(dir, ".git"))) return { root: dir, marked: false };
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+// Comparable form of a repo location: lowercase, no scheme, no credentials,
+// `git@host:owner/repo` spelled like `host/owner/repo`, no trailing `.git`.
+export function normalizeRepoLocation(value) {
+  if (typeof value !== "string") return "";
+  let text = value.trim().toLowerCase();
+  if (!text) return "";
+  text = text.replace(/^[a-z+]+:\/\//, "").replace(/^[^@/]+@/, "");
+  text = text.replace(/^([^/:]+):(?!\d+\/)/, "$1/");
+  return text.replace(/\.git$/, "").replace(/\/+$/, "");
+}
+
+export function repoRemotes(root) {
+  const out = runGit(root, ["config", "--get-regexp", "^remote\\..*\\.url$"]);
+  if (!out) return [];
+  return out.split(/\r?\n/).map((line) => line.split(/\s+/)[1]).filter(Boolean);
+}
+
+// Pure: does any board project point at this repository (by remote URL or by
+// local path)?
+export function repoMatchesProject(projects, root, remotes) {
+  const wanted = new Set(
+    [...remotes, root].map(normalizeRepoLocation).filter(Boolean),
+  );
+  return (projects ?? []).some((project) => {
+    const url = normalizeRepoLocation(project?.repo_url);
+    return url !== "" && wanted.has(url);
+  });
+}
+
+// Is the work in `cwd` tied to the board? Tri-state so the caller keeps its
+// board-down behaviour: true = bound, false = proven unbound, null = could not
+// tell (board unreachable or unreadable) and the caller must stay strict.
+export async function cwdBoundToBoard(cwd) {
+  const found = findRepoRoot(cwd);
+  if (!found) return false;
+  if (found.marked) return true;
+  const probe = await mcpCallProbe("project_list", "{}");
+  if (!probe.reachable) return null;
+  const document = parseJson(probe.raw);
+  if (!document) return null;
+  let projects;
+  try {
+    projects = payloadOf(document)?.projects;
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(projects)) return null;
+  return repoMatchesProject(projects, found.root, repoRemotes(found.root));
+}
+
 // The directory `install.sh` clones/updates ustoppble/overclick into — the
 // board's own source checkout, never the plugin copy a CLI executes hooks
 // from. AC 21's `docker compose ps|up|restart` recovery is scoped to this
